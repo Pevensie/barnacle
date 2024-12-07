@@ -1,5 +1,5 @@
-import barnacle/internal/dns
-import barnacle/internal/local_epmd
+import barnacle/dns
+import barnacle/local_epmd
 import gleam/erlang/atom
 import gleam/erlang/node
 import gleam/erlang/process.{type Subject}
@@ -198,13 +198,24 @@ pub fn epmd(nodes: List(atom.Atom)) -> Barnacle(Nil) {
 /// with the same basename.
 ///
 /// The second argument is the hostname to query against. Both A and AAAA records
-/// will be queried.
-pub fn dns(basename: String, hostname_query: String) -> Barnacle(Nil) {
+/// will be queried. The final argument is an optional timeout for the DNS
+/// lookup. This defaults to 5000ms if not supplied.
+pub fn dns(
+  basename: String,
+  hostname_query: String,
+  timeout: Option(Int),
+) -> Barnacle(dns.LookupError) {
   Barnacle(
     ..default_barnacle(),
     strategy: Strategy(
       ..default_strategy(),
-      discover_nodes: fn() { dns.discover_nodes(basename, hostname_query) },
+      discover_nodes: fn() {
+        dns.discover_nodes(
+          basename,
+          hostname_query,
+          option.unwrap(timeout, 5000),
+        )
+      },
     ),
   )
 }

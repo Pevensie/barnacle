@@ -17,6 +17,8 @@ fn get_hostname() -> String {
   hostname
 }
 
+/// Discover nodes using the local EPMD. This will discover nodes on the same
+/// hostname as the current node.
 pub fn discover_nodes() -> Result(List(atom.Atom), Nil) {
   let hostname = get_hostname()
   list_local_nodes()
