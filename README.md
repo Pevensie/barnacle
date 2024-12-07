@@ -159,6 +159,7 @@ Barnacle provides a helper function to get the basename of the current node.
 
 ```gleam
 import barnacle
+import gleam/option
 
 pub fn main() {
   let assert Ok(basename) = barnacle.get_node_basename(node.self())
@@ -166,6 +167,8 @@ pub fn main() {
     basename,
     // The hostname to query against
     "my_app.example.com",
+    // An optional timeout for the DNS lookup
+    option.Some(7500),
   )
   |> barnacle.start
 }
