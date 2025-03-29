@@ -59,7 +59,7 @@ pub fn dns_lookup(
       IpV6(a, b, c, d, e, f, g, h)
     })
 
-  Ok(list.concat([a_records, aaaa_records]))
+  Ok(list.append(a_records, aaaa_records))
 }
 
 fn format_ip_address(ip: IpAddress) -> String {
