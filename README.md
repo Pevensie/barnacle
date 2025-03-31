@@ -28,7 +28,7 @@ You'll also need to start your Gleam process with a node name, and set the cooki
 You can do this using the `ERL_FLAGS` environment variable.
 
 > [!NOTE]
-> There's a Fly.io example coming soon.
+> Check out the Fly.io demo by clicking [here](https://barnacle-demo.fly.dev/) ([source](./demo)).
 
 ```sh
 ERL_FLAGS="-name my_app@127.0.0.1 -setcookie my_cookie" gleam run
@@ -48,7 +48,7 @@ pub fn main() {
     |> barnacle.with_poll_interval(15_000)
     |> barnacle.with_name("my_barnacle")
 
-  // Create a process to receive the child process later
+  // Create a subject to receive the child process later
   let self = process.new_subject()
 
   // Start the child process under a supervisor
