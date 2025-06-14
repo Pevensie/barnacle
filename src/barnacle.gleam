@@ -3,11 +3,10 @@ import barnacle/local_epmd
 import gleam/erlang/atom
 import gleam/erlang/node
 import gleam/erlang/process.{type Subject}
-import gleam/function
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
-import gleam/otp/supervisor
+import gleam/otp/supervision
 import gleam/result
 import gleam/set
 import gleam/string
@@ -18,7 +17,7 @@ import gleam/string
 /// strategy-specific functions.
 pub opaque type Barnacle(error) {
   Barnacle(
-    name: Option(atom.Atom),
+    name: Option(process.Name(Message(error))),
     strategy: Strategy(error),
     poll_interval: Int,
     listener: Option(Subject(BarnacleResponse(error))),
@@ -35,8 +34,11 @@ fn default_barnacle() -> Barnacle(error) {
 }
 
 /// Give the barnacle actor process a custom name.
-pub fn with_name(barnacle: Barnacle(error), name: String) -> Barnacle(error) {
-  Barnacle(..barnacle, name: Some(name |> atom.create_from_string))
+pub fn with_name(
+  barnacle: Barnacle(error),
+  name: process.Name(Message(error)),
+) -> Barnacle(error) {
+  Barnacle(..barnacle, name: Some(name))
 }
 
 /// Set the poll interval for the barnacle actor. Defaults to 5000ms.
@@ -131,7 +133,7 @@ fn disconnect_node(node: atom.Atom) -> Result(node.Node, NodeDisconnectError)
 
 fn list_nodes() -> Result(List(atom.Atom), error) {
   [node.self(), ..node.visible()]
-  |> list.map(node.to_atom)
+  |> list.map(node.name)
   |> Ok
 }
 
@@ -207,16 +209,9 @@ pub fn dns(
 ) -> Barnacle(dns.LookupError) {
   Barnacle(
     ..default_barnacle(),
-    strategy: Strategy(
-      ..default_strategy(),
-      discover_nodes: fn() {
-        dns.discover_nodes(
-          basename,
-          hostname_query,
-          option.unwrap(timeout, 5000),
-        )
-      },
-    ),
+    strategy: Strategy(..default_strategy(), discover_nodes: fn() {
+      dns.discover_nodes(basename, hostname_query, option.unwrap(timeout, 5000))
+    }),
   )
 }
 
@@ -253,18 +248,18 @@ type State(error) {
 pub fn start(barnacle: Barnacle(error)) {
   barnacle
   |> spec(None)
-  |> actor.start_spec
+  |> actor.start
 }
 
 /// Create a child spec for your barnacle for use in a supervision tree.
-pub fn child_spec(
+pub fn supervised(
   barnacle: Barnacle(error),
   parent: Subject(Subject(Message(error))),
 ) {
-  supervisor.worker(fn(_) {
+  supervision.worker(fn() {
     barnacle
     |> spec(Some(parent))
-    |> actor.start_spec
+    |> actor.start
   })
 }
 
@@ -282,18 +277,18 @@ pub fn run_once(barnacle: Barnacle(error)) {
 ///
 /// This will reset the poll timer.
 pub fn refresh(subject: Subject(Message(error)), timeout: Int) {
-  actor.call(subject, fn(subj) { Refresh(Some(subj)) }, timeout)
+  actor.call(subject, timeout, fn(subj) { Refresh(Some(subj)) })
 }
 
 /// Pause a barnacle actor. Sending a [`refresh`](#refresh) will restart the actor.
 pub fn pause(subject: Subject(Message(error)), timeout: Int) {
-  actor.call(subject, fn(subj) { Pause(Some(subj)) }, timeout)
+  actor.call(subject, timeout, fn(subj) { Pause(Some(subj)) })
 }
 
 /// Shutdown a barnacle actor. This will stop the actor, and stop any future
 /// refreshes.
 pub fn shutdown(subject: Subject(Message(error)), timeout: Int) {
-  actor.call(subject, fn(subj) { Shutdown(Some(subj)) }, timeout)
+  actor.call(subject, timeout, fn(subj) { Shutdown(Some(subj)) })
 }
 
 /// The error type for a barnacle refresh.
@@ -303,7 +298,7 @@ pub type RefreshError(error) {
   DisconnectError(List(#(atom.Atom, NodeDisconnectError)))
 }
 
-fn handle_message(message: Message(error), state: State(error)) {
+fn handle_message(state: State(error), message: Message(error)) {
   let State(self:, barnacle:, timer:) = state
   case message {
     Refresh(return) -> {
@@ -327,7 +322,7 @@ fn handle_message(message: Message(error), state: State(error)) {
       cancel_timer(timer)
       send_response(return, Nil)
       send_response(barnacle.listener, ShutdownResponse(Nil))
-      actor.Stop(process.Normal)
+      actor.stop()
     }
   }
 }
@@ -336,22 +331,28 @@ fn spec(
   barnacle: Barnacle(error),
   parent: Option(Subject(Subject(Message(error)))),
 ) {
-  actor.Spec(init_timeout: 10_000, loop: handle_message, init: fn() {
-    option.map(barnacle.name, process.register(process.self(), _))
-    let self = process.new_subject()
+  actor.new_with_initialiser(10_000, fn(self) {
+    use _ <- result.try(
+      barnacle.name
+      |> option.map(process.register(process.self(), _))
+      |> option.unwrap(Ok(Nil))
+      |> result.replace_error("Failed to register process"),
+    )
+
     let selector =
       process.new_selector()
-      |> process.selecting(self, function.identity)
+      |> process.select(self)
 
     option.map(parent, process.send(_, self))
 
     let timer = process.send_after(self, barnacle.poll_interval, Refresh(None))
 
-    actor.Ready(
-      selector: selector,
-      state: State(self:, barnacle:, timer: Some(timer)),
-    )
+    actor.initialised(State(self:, barnacle:, timer: Some(timer)))
+    |> actor.selecting(selector)
+    |> actor.returning(self)
+    |> Ok
   })
+  |> actor.on_message(handle_message)
 }
 
 fn send_response(maybe_client: Option(Subject(a)), response: a) -> Nil {
@@ -375,7 +376,7 @@ fn refresh_nodes(barnacle: Barnacle(error)) -> RefreshResult(error) {
     |> result.map_error(StrategyError),
   )
 
-  let self = node.self() |> node.to_atom
+  let self = node.self() |> node.name
 
   let available_nodes =
     available_nodes_list
@@ -427,7 +428,7 @@ fn result_apply(results: List(Result(a, b))) -> Result(List(a), List(b)) {
 /// ```
 pub fn get_node_basename(node: node.Node) -> Result(String, Nil) {
   node
-  |> node.to_atom
+  |> node.name
   |> atom.to_string
   |> string.split_once("@")
   |> result.map(fn(tuple) { tuple.0 })
