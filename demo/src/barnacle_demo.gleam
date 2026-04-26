@@ -5,11 +5,11 @@
 import argv
 import barnacle
 import barnacle_demo/node_list
-import gleam/bytes_builder
-import gleam/erlang
+import envoy
+import gleam/bytes_tree
+import gleam/erlang/application
 import gleam/erlang/atom
 import gleam/erlang/node
-import gleam/erlang/os
 import gleam/erlang/process.{type Selector, type Subject}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
@@ -18,7 +18,6 @@ import gleam/io
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import gleam/otp/actor
 import gleam/result
 import gleam/string
 import lustre
@@ -56,18 +55,18 @@ pub fn main() {
   let listener = process.new_subject()
 
   // Get the Fly app name from the environment
-  let assert Ok(app_name) = os.get_env("FLY_APP_NAME")
+  let assert Ok(app_name) = envoy.get("FLY_APP_NAME")
 
   let barnacle =
     // Use internal DNS to connect to the nodes
-    barnacle.dns(basename, app_name <> ".internal")
+    barnacle.dns(basename, app_name <> ".internal", None)
     |> barnacle.with_listener(listener)
     |> barnacle.with_poll_interval(barnacle_poll_interval)
 
   let assert Ok(barnacle_subject) = barnacle.start(barnacle)
 
-  let app = node_list.app()
-  let assert Ok(node_list) = lustre.start_actor(app, barnacle_subject)
+  let assert Ok(node_list) =
+    lustre.start_server_component(node_list.component(), barnacle_subject.data)
 
   let assert Ok(_) = run_server(port, node_list)
   listen_and_publish(listener, node_list)
@@ -76,11 +75,11 @@ pub fn main() {
 // ----- Server component updater ----- //
 
 type NodeList =
-  Subject(lustre.Action(node_list.Msg, lustre.ServerComponent))
+  lustre.Runtime(node_list.Msg)
 
 fn listen_and_publish(
   listener: Subject(barnacle.BarnacleResponse(a)),
-  node_list: NodeList,
+  node_list: lustre.Runtime(_),
 ) {
   case process.receive(listener, listener_poll_interval) {
     Ok(barnacle.RefreshResponse(Ok(nodes))) -> {
@@ -93,12 +92,15 @@ fn listen_and_publish(
     _ -> Nil
   }
 
-  process.send(
+  lustre.send(
     node_list,
     lustre.dispatch(node_list.UpdateNodes(
       [node.self(), ..node.visible()]
-      |> io.debug
-      |> list.map(fn(node) { node |> node.to_atom |> atom.to_string })
+      |> fn(nodes) {
+        nodes |> string.inspect |> io.println
+        nodes
+      }
+      |> list.map(fn(node) { node |> node.name |> atom.to_string })
       |> list.sort(string.compare),
     )),
   )
@@ -108,7 +110,7 @@ fn listen_and_publish(
 
 // ----- Mist server ----- //
 
-fn run_server(port: Int, node_list: NodeList) {
+fn run_server(port: Int, node_list: lustre.Runtime(_)) {
   fn(req: Request(Connection)) -> Response(ResponseData) {
     case request.path_segments(req) {
       ["node_list"] ->
@@ -120,7 +122,7 @@ fn run_server(port: Int, node_list: NodeList) {
         )
 
       ["lustre-server-component.mjs"] -> {
-        let assert Ok(priv) = erlang.priv_directory("lustre")
+        let assert Ok(priv) = application.priv_directory("lustre")
         let path = priv <> "/static/lustre-server-component.mjs"
 
         mist.send_file(path, offset: 0, limit: None)
@@ -131,7 +133,7 @@ fn run_server(port: Int, node_list: NodeList) {
         })
         |> result.lazy_unwrap(fn() {
           response.new(404)
-          |> response.set_body(mist.Bytes(bytes_builder.new()))
+          |> response.set_body(mist.Bytes(bytes_tree.new()))
         })
       }
 
@@ -158,8 +160,8 @@ fn run_server(port: Int, node_list: NodeList) {
               ),
             ]),
           ])
-          |> element.to_document_string_builder
-          |> bytes_builder.from_string_builder
+          |> element.to_document_string()
+          |> bytes_tree.from_string()
           |> mist.Bytes,
         )
     }
@@ -167,58 +169,60 @@ fn run_server(port: Int, node_list: NodeList) {
   |> mist.new
   |> mist.bind("0.0.0.0")
   |> mist.port(port)
-  |> mist.start_http
+  |> mist.start()
 }
 
-type State =
-  #(String, NodeList)
+type State {
+  State(id: String, component: NodeList)
+}
 
 fn socket_init(
   _conn: WebsocketConnection,
-  node_list: NodeList,
-) -> #(State, Option(Selector(lustre.Patch(node_list.Msg)))) {
+  runtime: lustre.Runtime(_),
+) -> #(State, Option(Selector(server_component.ClientMessage(node_list.Msg)))) {
   let self = process.new_subject()
   let id = uuid.v4() |> uuid.to_string
 
-  process.send(node_list, server_component.subscribe(id, process.send(self, _)))
+  let selector =
+    process.new_selector()
+    |> process.select(self)
 
-  #(
-    #(id, node_list),
-    Some(process.selecting(process.new_selector(), self, fn(a) { a })),
-  )
+  server_component.register_subject(self)
+  |> lustre.send(to: runtime)
+
+  #(State(id, runtime), Some(selector))
 }
 
 fn socket_update(
   state: State,
+  msg: WebsocketMessage(server_component.ClientMessage(node_list.Msg)),
   conn: WebsocketConnection,
-  msg: WebsocketMessage(lustre.Patch(node_list.Msg)),
-) {
+) -> mist.Next(State, server_component.ClientMessage(node_list.Msg)) {
   case msg {
     mist.Text(json) -> {
-      let action = json.decode(json, server_component.decode_action)
+      let action = json.parse(json, server_component.runtime_message_decoder())
 
       case action {
-        Ok(action) -> process.send(state.1, action)
+        Ok(action) -> lustre.send(state.component, action)
         Error(_) -> Nil
       }
 
-      actor.continue(state)
+      mist.continue(state)
     }
 
-    mist.Binary(_) -> actor.continue(state)
-    mist.Custom(patch) -> {
-      let assert Ok(_) =
-        patch
-        |> server_component.encode_patch
-        |> json.to_string
-        |> mist.send_text_frame(conn, _)
+    mist.Binary(_) -> mist.continue(state)
+    mist.Custom(client_message) -> {
+      let json = server_component.client_message_to_json(client_message)
 
-      actor.continue(state)
+      let assert Ok(_) = mist.send_text_frame(conn, json.to_string(json))
+
+      mist.continue(state)
     }
-    mist.Closed | mist.Shutdown -> actor.Stop(process.Normal)
+    mist.Closed | mist.Shutdown -> mist.stop()
   }
 }
 
-fn socket_close(state: State) {
-  process.send(state.1, server_component.unsubscribe(state.0))
+fn socket_close(state: State) -> Nil {
+  lustre.shutdown()
+  |> lustre.send(to: state.component)
 }

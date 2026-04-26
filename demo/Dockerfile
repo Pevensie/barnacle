@@ -1,4 +1,4 @@
-FROM ghcr.io/gleam-lang/gleam:v1.6.3-erlang-alpine
+FROM ghcr.io/gleam-lang/gleam:v1.16.0-erlang-alpine
 
 COPY gleam.toml manifest.toml /build/
 
