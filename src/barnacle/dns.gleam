@@ -99,7 +99,7 @@ pub fn discover_nodes(
   ip_addresses
   |> list.map(fn(ip) {
     let ip_string = format_ip_address(ip)
-    { basename <> "@" <> ip_string } |> atom.create_from_string
+    { basename <> "@" <> ip_string } |> atom.create
   })
   |> Ok
 }
